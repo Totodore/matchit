@@ -3,8 +3,8 @@ use crate::{InsertError, MatchError, Params};
 
 use std::cell::UnsafeCell;
 use std::cmp::min;
-use std::mem;
 use std::ops::Range;
+use std::{mem, vec};
 
 /// The types of nodes the tree can hold
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone)]
@@ -173,6 +173,91 @@ impl<T> Node<T> {
         }
     }
 
+    fn remove_drop_child(
+        node: &mut Node<T>,
+        i: usize,
+        param_remapping: Vec<Vec<u8>>,
+        mut visited: Vec<*mut Node<T>>,
+    ) -> Option<T> {
+        if node.children[i].param_remapping != param_remapping {
+            return None;
+        }
+        // if the node we are dropping doesn't have any children, we can remove it
+        let val = if node.children[i].children.is_empty() {
+            // if the parent node only has one child there are no indices
+            if node.children.len() == 1 && node.indices.is_empty() {
+                node.wild_child = false;
+                node.children.remove(0).value.take()
+            } else {
+                let child = node.children.remove(i);
+                // Indices are only used for static nodes
+                if child.node_type == NodeType::Static {
+                    node.indices.remove(i);
+                } else {
+                    // It was a dynamic node, we remove the wildcard child flag
+                    node.wild_child = false;
+                }
+                child.value
+            }
+        } else {
+            node.children[i].value.take()
+        };
+
+        // walk back up the branch and check if we can clean up the parent nodes
+        while let Some(node) = visited.pop() {
+            let node = unsafe { &mut *node };
+            println!(
+                "checking {}",
+                std::str::from_utf8(node.prefix.inner()).unwrap()
+            );
+            // If the node has only one empty child, we can remove it
+            if node.children.len() == 1
+                && node.children[0].value.is_none()
+                && node.children[0].children.is_empty()
+            {
+                println!(
+                    "cleaning up {} child",
+                    std::str::from_utf8(node.prefix.inner()).unwrap()
+                );
+                node.children.remove(0);
+                if let Some(parent) = visited.last() {
+                    let parent = unsafe { &mut **parent };
+                    let i = parent
+                        .indices
+                        .iter()
+                        .position(|&c| c == node.prefix[0])
+                        .unwrap_or(0);
+                    parent.update_child_priority(i);
+                }
+            }
+            if node.children.len() == 1 && !node.wild_child && node.value.is_none() {
+                let child = node.children.remove(0);
+                println!(
+                    "shrinking {} child",
+                    std::str::from_utf8(child.prefix.inner()).unwrap()
+                );
+                node.prefix.append(&child.prefix);
+                node.children = child.children;
+                node.indices = child.indices;
+                node.wild_child = child.wild_child;
+                node.value = child.value;
+                node.param_remapping = child.param_remapping;
+                let parent = unsafe { &mut **visited.last().unwrap() };
+                let i = parent
+                    .indices
+                    .iter()
+                    .position(|&c| c == node.prefix[0])
+                    .unwrap();
+                parent.update_child_priority(i);
+            }
+            // The node has a child with a value, we can't go further up
+            else if node.children.len() > 0 {
+                break;
+            }
+        }
+
+        val.map(UnsafeCell::into_inner)
+    }
     /// Removes a route from the tree, returning the value if the route existed.
     /// The provided path should be the same as the one used to insert the route (including wildcards).
     pub fn remove(&mut self, full_path: impl Into<String>) -> Option<T> {
@@ -181,34 +266,7 @@ impl<T> Node<T> {
         let (full_path, param_remapping) = normalize_params(unescaped).ok()?;
         let full_path = full_path.into_inner();
         let mut path: &[u8] = full_path.as_ref();
-
-        let drop_child = |node: &mut Node<T>, i: usize| -> Option<T> {
-            if node.children[i].param_remapping != param_remapping {
-                return None;
-            }
-            // if the node we are dropping doesn't have any children, we can remove it
-            let val = if node.children[i].children.is_empty() {
-                // if the parent node only has one child there are no indices
-                if node.children.len() == 1 && node.indices.is_empty() {
-                    node.wild_child = false;
-                    node.children.remove(0).value.take()
-                } else {
-                    let child = node.children.remove(i);
-                    // Indices are only used for static nodes
-                    if child.node_type == NodeType::Static {
-                        node.indices.remove(i);
-                    } else {
-                        // It was a dynamic node, we remove the wildcard child flag
-                        node.wild_child = false;
-                    }
-                    child.value
-                }
-            } else {
-                node.children[i].value.take()
-            };
-
-            val.map(UnsafeCell::into_inner)
-        };
+        let mut visited: Vec<*mut Node<T>> = Vec::new();
 
         // Specific case if we are removing the root node
         if path == current.prefix.inner() {
@@ -232,8 +290,10 @@ impl<T> Node<T> {
                     // If there is only one child we can continue with the child node
                     if current.children.len() == 1 {
                         if current.children[0].prefix.inner() == rest {
-                            return drop_child(current, 0);
+                            visited.push(current as *mut _);
+                            return Self::remove_drop_child(current, 0, param_remapping, visited);
                         } else {
+                            visited.push(current as *mut _);
                             current = &mut current.children[0];
                             continue 'walk;
                         }
@@ -243,8 +303,10 @@ impl<T> Node<T> {
                     if let Some(i) = current.indices.iter().position(|&c| c == first) {
                         // continue with the child node
                         if current.children[i].prefix.inner() == rest {
-                            return drop_child(current, i);
+                            visited.push(current as *mut _);
+                            return Self::remove_drop_child(current, i, param_remapping, visited);
                         } else {
+                            visited.push(current as *mut _);
                             current = &mut current.children[i];
                             continue 'walk;
                         }
@@ -260,8 +322,15 @@ impl<T> Node<T> {
                     {
                         // continue with the wildcard child
                         if current.children.last_mut().unwrap().prefix.inner() == rest {
-                            return drop_child(current, current.children.len() - 1);
+                            visited.push(current as *mut _);
+                            return Self::remove_drop_child(
+                                current,
+                                current.children.len() - 1,
+                                param_remapping,
+                                visited,
+                            );
                         } else {
+                            visited.push(current as *mut _);
                             current = current.children.last_mut().unwrap();
                             continue 'walk;
                         }
@@ -764,6 +833,37 @@ impl<T> Default for Node<T> {
             value: None,
             priority: 0,
         }
+    }
+}
+
+impl<T> std::fmt::Display for Node<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Display the entire tree structure with the prefix of each node
+        // and the value of each leaf node
+        fn fmt_node<T>(
+            node: &Node<T>,
+            f: &mut std::fmt::Formatter<'_>,
+            i: usize,
+        ) -> std::fmt::Result {
+            let prefix = std::str::from_utf8(&node.prefix).unwrap();
+            let has_value = node.value.is_some();
+            writeln!(
+                f,
+                "{}{} --> {} - {}",
+                "|---".repeat(i),
+                prefix,
+                has_value,
+                node.priority
+            )?;
+
+            for child in &node.children {
+                fmt_node(child, f, i + 1)?;
+            }
+
+            Ok(())
+        }
+        write!(f, "root\n")?;
+        fmt_node(self, f, 0)
     }
 }
 

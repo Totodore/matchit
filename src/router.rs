@@ -127,8 +127,11 @@ impl<T> Router<T> {
     /// assert_eq!(router.remove("/home/{id"), None);
     /// assert_eq!(router.remove("/home/{id}/"), Some("Hello!"));
     /// ```
-    pub fn remove(&mut self, path: impl Into<String>) -> Option<T> {
-        self.root.remove(path)
+    pub fn remove(&mut self, path: impl Into<String> + Clone) -> Option<T> {
+        println!("before remove: {} {}", path.clone().into(), self.root);
+        let n = self.root.remove(path.clone());
+        println!("after remove: {} {}", path.into(), self.root);
+        n
     }
 
     #[cfg(feature = "__test_helpers")]

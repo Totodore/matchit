@@ -30,6 +30,8 @@ impl RemoveTest {
                     assert_eq!(router.remove(*route), *expected, "removing {route}",)
                 }
             }
+
+            router.check_priorities().unwrap();
         }
 
         for route in self.remaining {
@@ -77,6 +79,20 @@ fn normalized() {
             (Remove, "/s/s/{s}/x", Some("/s/s/{s}/x")),
             (Remove, "/s/s/{y}/d", Some("/s/s/{y}/d")),
         ],
+        remaining: vec![],
+    }
+    .run();
+}
+
+#[test]
+fn empty_node_optimization() {
+    RemoveTest {
+        routes: vec!["/home", "/home/{id}", "/home/{id}/post/{pid}"],
+        ops: vec![(
+            Remove,
+            "/home/{id}/post/{pid}",
+            Some("/home/{id}/post/{pid}"),
+        )],
         remaining: vec![],
     }
     .run();
